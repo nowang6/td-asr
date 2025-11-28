@@ -246,8 +246,11 @@ class OnlineASRModel(ModelLoader):
         """Initialize encoder cache based on model input requirements"""
         encoder_inputs = self.encoder_session.get_inputs()
         cache_list = []
+        cache_names = []
         for inp in encoder_inputs:
-            if 'cache' in inp.name.lower() or 'in_cache' in inp.name:
+            name = inp.name
+            # Check for cache inputs: in_cache, cache, or names containing cache
+            if 'cache' in name.lower():
                 # Initialize cache with zeros based on shape
                 shape = []
                 for dim in inp.shape:
@@ -261,11 +264,16 @@ class OnlineASRModel(ModelLoader):
                         shape.append(int(dim))
                 cache = np.zeros(shape, dtype=np.float32)
                 cache_list.append(cache)
-                logger.debug(f"Initialized encoder cache {inp.name} with shape {shape}")
+                cache_names.append(name)
+                logger.debug(f"Initialized encoder cache {name} with shape {shape}")
+        
+        logger.info(f"Encoder cache initialized: {len(cache_list)} caches for {cache_names}")
+        
         if cache_list:
             self.encoder_cache = cache_list if len(cache_list) > 1 else cache_list[0]
         else:
             self.encoder_cache = None
+            logger.warning("No encoder cache inputs found - model may require cache inputs")
     
     def _init_decoder_cache(self):
         """Initialize decoder cache based on model input requirements"""
@@ -310,6 +318,8 @@ class OnlineASRModel(ModelLoader):
         encoder_inputs_info = self.encoder_session.get_inputs()
         encoder_input_names = [inp.name for inp in encoder_inputs_info]
         
+        logger.debug(f"Encoder input names: {encoder_input_names}")
+        
         # Find speech input (usually the first one or named 'speech')
         speech_input_name = None
         cache_input_names = []
@@ -320,24 +330,35 @@ class OnlineASRModel(ModelLoader):
             elif 'speech' in name.lower() or speech_input_name is None:
                 speech_input_name = name
         
+        logger.debug(f"Speech input: {speech_input_name}, Cache inputs: {cache_input_names}")
+        
         if speech_input_name:
             encoder_inputs[speech_input_name] = features[np.newaxis, :, :].astype(np.float32)
         
-        # Add all cache inputs
+        # Add all cache inputs - ensure encoder_cache is initialized
+        if self.encoder_cache is None:
+            # Initialize cache if not done
+            self._init_encoder_cache()
+        
         if cache_input_names:
-            if self.encoder_cache is None:
-                # Initialize cache if not done
-                self._init_encoder_cache()
-            
             if isinstance(self.encoder_cache, list):
                 # Multiple cache inputs
                 for i, cache_name in enumerate(cache_input_names):
                     if i < len(self.encoder_cache):
                         encoder_inputs[cache_name] = self.encoder_cache[i]
+                        logger.debug(f"Added encoder cache {cache_name} with shape {self.encoder_cache[i].shape}")
+                    else:
+                        logger.warning(f"Cache index {i} out of range for {cache_name}")
             elif self.encoder_cache is not None:
                 # Single cache input (shouldn't happen with multiple cache names, but handle it)
                 if len(cache_input_names) == 1:
                     encoder_inputs[cache_input_names[0]] = self.encoder_cache
+                else:
+                    logger.warning(f"Multiple cache names but single cache value: {cache_input_names}")
+        else:
+            logger.warning("No cache input names found, but encoder may require them")
+        
+        logger.debug(f"Encoder inputs keys: {list(encoder_inputs.keys())}")
         
         encoder_outputs = self.encoder_session.run(None, encoder_inputs)
         
