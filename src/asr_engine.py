@@ -106,7 +106,10 @@ class ASREngine:
         Returns:
             List of ASR results
         """
+        from loguru import logger
+        
         results = []
+        logger.debug(f"process_audio_chunk called: chunk_len={len(audio_chunk)}, is_finished={is_finished}")
         
         # Add to buffer
         if len(audio_chunk) > 0:
@@ -115,10 +118,11 @@ class ASREngine:
         
         # For streaming mode (is_finished=False), return online results
         if not is_finished:
+            logger.debug(f"Entering streaming mode (is_finished=False)")
             # Online ASR processing (streaming results)
             # Process the new chunk with online model (maintaining state via cache)
+            logger.debug(f"Checking online ASR: model={self.online_asr_model is not None}, chunk_len={len(audio_chunk)}")
             if self.online_asr_model and len(audio_chunk) > 0:
-                from loguru import logger
                 
                 # Extract features for this chunk only
                 features = self.online_asr_model.extract_features(audio_chunk)
