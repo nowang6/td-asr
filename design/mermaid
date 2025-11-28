@@ -1,0 +1,27 @@
+sequenceDiagram
+    participant Client as 客户端
+    participant MQ_In as 消息队列(接收)
+    participant VAD as FSMN-VAD-realtime<br>（实时端点检测）
+    participant ASR_On as Paraformer-online<br>（实时识别）
+    participant MQ_Out as 消息队列(下发)
+    participant ASR_Off as Paraformer-offline<br>（非实时识别）
+    participant CTT as CT-Transformer<br>（标点预测）
+    participant ITN as ITN<br>（逆文本正规化）
+
+    %% ===== Online 流程 =====
+    Client ->> MQ_In: 发送音频
+    MQ_In ->> VAD: 音频流输入
+
+    VAD ->> VAD: 检测非静音段(每600ms)
+    VAD ->> ASR_On: 非静音段音频
+
+    ASR_On ->> MQ_Out: 实时识别结果(每600ms)
+
+    %% ===== VAD 尾点触发 Offline =====
+    VAD -->> ASR_Off: 尾点触发(整段音频)
+    ASR_Off ->> CTT: 完整识别文本
+    CTT ->> ITN: 带标点文本
+    ITN ->> MQ_Out: 修正后的最终文本
+
+    MQ_Out ->> Client: 返回识别结果
+
