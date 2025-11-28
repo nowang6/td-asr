@@ -120,13 +120,16 @@ class ASREngine:
         if not is_finished:
             logger.debug(f"Entering streaming mode (is_finished=False)")
             # Online ASR processing (streaming results)
-            # Process the new chunk with online model (maintaining state via cache)
+            # Use frontend's streaming feature extraction (maintains internal buffer)
             logger.debug(f"Checking online ASR: model={self.online_asr_model is not None}, chunk_len={len(audio_chunk)}")
             if self.online_asr_model and len(audio_chunk) > 0:
+                # Add chunk to frontend buffer
+                self.online_asr_model.frontend.add_audio(audio_chunk)
+                logger.debug(f"Added {len(audio_chunk)} samples to frontend buffer")
                 
-                # Extract features for this chunk only
-                features = self.online_asr_model.extract_features(audio_chunk)
-                logger.debug(f"Extracted features: shape={features.shape if len(features) > 0 else 'empty'}")
+                # Extract features from frontend buffer (streaming mode)
+                features, consumed = self.online_asr_model.frontend.extract_feat_streaming(return_samples=True)
+                logger.debug(f"Extracted features from stream: shape={features.shape if len(features) > 0 else 'empty'}, consumed={consumed} samples")
                 
                 # Run online inference (this maintains encoder cache internally)
                 if len(features) > 0:
