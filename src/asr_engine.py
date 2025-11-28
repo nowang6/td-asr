@@ -133,7 +133,7 @@ class ASREngine:
                 
                 # Run online inference (this maintains encoder cache internally)
                 if len(features) > 0:
-                    text = self.online_asr_model.infer(features)
+                    text = self.online_asr_model.infer(features, is_finished=False)
                     
                     # Log for debugging
                     logger.debug(f"Online ASR chunk result: text='{text}', len={len(text) if text else 0}")
