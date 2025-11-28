@@ -118,16 +118,18 @@ class ASREngine:
             # Online ASR processing (streaming results)
             # Process the new chunk with online model (maintaining state via cache)
             if self.online_asr_model and len(audio_chunk) > 0:
+                from loguru import logger
+                
                 # Extract features for this chunk only
                 features = self.online_asr_model.extract_features(audio_chunk)
+                logger.debug(f"Extracted features: shape={features.shape if len(features) > 0 else 'empty'}")
                 
                 # Run online inference (this maintains encoder cache internally)
                 if len(features) > 0:
                     text = self.online_asr_model.infer(features)
                     
                     # Log for debugging
-                    from loguru import logger
-                    logger.debug(f"Online ASR chunk result: '{text}' (chunk: {len(audio_chunk)} samples, features: {features.shape})")
+                    logger.debug(f"Online ASR chunk result: text='{text}', len={len(text) if text else 0}")
                     
                     if text and text.strip():
                         # Create intermediate result (2pass-online)
@@ -137,6 +139,11 @@ class ASREngine:
                             timestamp=0
                         )
                         results.append(result)
+                        logger.debug(f"Added result to list, total results: {len(results)}")
+                    else:
+                        logger.debug(f"Text is empty or whitespace only, not adding result")
+                else:
+                    logger.debug("No features extracted, skipping inference")
         
         # For final mode (is_finished=True), return offline results
         else:
