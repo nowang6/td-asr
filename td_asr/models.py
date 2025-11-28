@@ -56,30 +56,56 @@ class ModelLoader:
         return session
     
     def _load_cmvn(self) -> Optional[np.ndarray]:
-        """Load CMVN statistics"""
+        """Load CMVN statistics from Kaldi Nnet format"""
         cmvn_path = self.model_dir / "am.mvn"
         if not cmvn_path.exists():
             return None
         
-        cmvn_data = []
-        with open(cmvn_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    values = [float(x) for x in line.split()]
-                    cmvn_data.append(values)
+        means = []
+        vars = []
         
-        if cmvn_data:
-            cmvn = np.array(cmvn_data, dtype=np.float32)
-            # CMVN format: [count, mean, var] or [mean, var]
-            if cmvn.shape[1] == 3:
-                # Extract mean and var
-                count = cmvn[:, 0]
-                mean = cmvn[:, 1]
-                var = cmvn[:, 2] / count  # Normalize variance
-                return np.stack([mean, var])
-            elif cmvn.shape[1] == 2:
-                return cmvn.T
+        try:
+            with open(cmvn_path, 'r') as f:
+                lines = f.readlines()
+                i = 0
+                while i < len(lines):
+                    line = lines[i].strip()
+                    parts = line.split()
+                    
+                    if parts and parts[0] == "<AddShift>":
+                        # Next line should be <LearnRateCoef>
+                        i += 1
+                        if i < len(lines):
+                            means_line = lines[i].strip()
+                            means_parts = means_line.split()
+                            if means_parts and means_parts[0] == "<LearnRateCoef>":
+                                # Extract mean values from index 3 to second-to-last
+                                for j in range(3, len(means_parts) - 1):
+                                    means.append(float(means_parts[j]))
+                    
+                    elif parts and parts[0] == "<Rescale>":
+                        # Next line should be <LearnRateCoef>
+                        i += 1
+                        if i < len(lines):
+                            vars_line = lines[i].strip()
+                            vars_parts = vars_line.split()
+                            if vars_parts and vars_parts[0] == "<LearnRateCoef>":
+                                # Extract std values from index 3 to second-to-last
+                                for j in range(3, len(vars_parts) - 1):
+                                    vars.append(float(vars_parts[j]))
+                    
+                    i += 1
+        except Exception as e:
+            logger.warning(f"Error loading CMVN from {cmvn_path}: {e}")
+            return None
+        
+        if means and vars:
+            # Convert to numpy arrays
+            mean_array = np.array(means, dtype=np.float32)
+            var_array = np.array(vars, dtype=np.float32)
+            # Return as [mean, var] shape (2, feature_dim)
+            return np.stack([mean_array, var_array])
+        
         return None
 
 class VADModel(ModelLoader):
