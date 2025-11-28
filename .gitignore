@@ -151,5 +151,8 @@ Thumbs.db
 # Project specific
 cpp-implement/build/
 cpp-implement/third_party/ffmpeg-master-latest-linux64-gpl-shared/
+cpp-implement/third_party/ffmpeg-master-latest-win64-gpl-shared/
 cpp-implement/third_party/onnxruntime-linux-x64-1.14.0/
+models/**/*.onnx
+models/**/*.fst
 
