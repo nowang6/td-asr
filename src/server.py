@@ -165,19 +165,26 @@ async def websocket_handler(websocket: WebSocket):
                 
                 audio_bytes = message["bytes"]
                 audio_buffer += audio_bytes
+                logger.debug(f"Received {len(audio_bytes)} bytes, buffer now {len(audio_buffer)} bytes")
                 
                 # Process audio in chunks of 800*2 bytes (800 samples = 50ms @ 16kHz)
                 # This matches the C++ implementation (line 135-175 in websocket-server-2pass.cpp)
                 chunk_size_bytes = chunk_size * 2  # PCM 16-bit = 2 bytes per sample
                 
                 # Process each complete chunk immediately (like C++ implementation)
+                chunks_processed = 0
                 while len(audio_buffer) >= chunk_size_bytes:
                     # Extract one chunk
                     chunk = audio_buffer[:chunk_size_bytes]
                     audio_buffer = audio_buffer[chunk_size_bytes:]
+                    chunks_processed += 1
+                    
+                    logger.debug(f"Processing chunk {chunks_processed} ({len(chunk)} bytes)")
                     
                     # Process this chunk with online ASR
                     results = engine.process_audio_bytes(chunk, is_finished=False)
+                    
+                    logger.debug(f"Chunk {chunks_processed} produced {len(results)} results")
                     
                     # Send results (only if not empty)
                     for result in results:
@@ -189,7 +196,10 @@ async def websocket_handler(websocket: WebSocket):
                                 "mode": "2pass-offline" if result.is_final else "2pass-online"
                             }
                             await websocket.send_json(response)
-                            logger.info(f"Sent result: {response}")
+                            logger.info(f"Sent online result: {response}")
+                
+                if chunks_processed > 0:
+                    logger.info(f"Processed {chunks_processed} chunks, buffer remaining: {len(audio_buffer)} bytes")
             
             else:
                 logger.warning(f"Unknown message type: {message}")
