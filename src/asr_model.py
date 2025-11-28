@@ -271,18 +271,35 @@ class OnlineASRModel:
         # Run decoder
         outputs = self.decoder_session.run(self.decoder_output_names, inputs)
         
-        # Extract predictions (argmax)
-        # Output shape: [1, T', vocab_size] or just predictions
-        predictions = outputs[0]
-        if len(predictions.shape) == 3:
-            predictions = predictions[0]  # [T', vocab_size]
-            token_ids = np.argmax(predictions, axis=-1).tolist()
-        elif len(predictions.shape) == 2:
-            # Already [T', vocab_size]
+        # Check if 'sample_ids' is in outputs (decoder may directly output token IDs)
+        sample_ids_output = None
+        logits_output = None
+        
+        for i, name in enumerate(self.decoder_output_names):
+            if name == 'sample_ids':
+                sample_ids_output = outputs[i]
+            elif name == 'logits':
+                logits_output = outputs[i]
+        
+        # Prefer sample_ids if available (already token IDs)
+        if sample_ids_output is not None:
+            token_ids = sample_ids_output.flatten().tolist()
+        elif logits_output is not None:
+            # Use logits with argmax
+            predictions = logits_output
+            if len(predictions.shape) == 3:
+                predictions = predictions[0]  # [T', vocab_size]
             token_ids = np.argmax(predictions, axis=-1).tolist()
         else:
-            # Already token IDs
-            token_ids = predictions.flatten().tolist()
+            # Fallback: use first output
+            predictions = outputs[0]
+            if len(predictions.shape) == 3:
+                predictions = predictions[0]
+                token_ids = np.argmax(predictions, axis=-1).tolist()
+            elif len(predictions.shape) == 2:
+                token_ids = np.argmax(predictions, axis=-1).tolist()
+            else:
+                token_ids = predictions.flatten().tolist()
         
         return token_ids
     
@@ -323,15 +340,25 @@ class OnlineASRModel:
         if not self.tokens:
             return ''.join([str(tid) for tid in token_ids])
         
+        from loguru import logger
+        
         text_parts = []
         for tid in token_ids:
             if 0 <= tid < len(self.tokens):
                 token = self.tokens[tid]
-                # Skip special tokens
-                if token not in ['<blank>', '<unk>', '<s>', '</s>', '<pad>']:
-                    text_parts.append(token)
+                # Skip special tokens (check the actual token strings)
+                if token in ['<blank>', '<unk>', '<s>', '</s>', '<pad>', '<eos>', '<sos>']:
+                    continue
+                # Skip if token starts with < and ends with > (special tokens)
+                if token.startswith('<') and token.endswith('>'):
+                    continue
+                text_parts.append(token)
+            else:
+                logger.warning(f"Token ID {tid} out of range (vocab size: {len(self.tokens)})")
         
-        return ''.join(text_parts)
+        result = ''.join(text_parts)
+        logger.debug(f"Converted {len(token_ids)} tokens to text: '{result}'")
+        return result
 
 
 class OfflineASRModel:
