@@ -40,6 +40,7 @@ def init_engine_factory(
 
 def create_engine() -> TwoPassASREngine:
     """Create a new ASR engine instance"""
+    global _engine_factory
     if _engine_factory is None:
         from .config import VAD_MODEL_DIR, ONLINE_ASR_MODEL_DIR, OFFLINE_ASR_MODEL_DIR, PUNC_MODEL_DIR
         _engine_factory = {
