@@ -302,7 +302,7 @@ bool Audio::FfmpegLoad(const char *filename, bool copy2char){
         avformat_free_context(formatContext);
         return false;
     }
-    const AVCodec* codec = nullptr;
+    AVCodec* codec = nullptr;
     AVCodecParameters* codecParameters = nullptr;
     int audioStreamIndex = av_find_best_stream(formatContext, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
     if (audioStreamIndex >= 0) {
@@ -483,7 +483,7 @@ bool Audio::FfmpegLoad(const char* buf, int n_file_len){
         avformat_free_context(formatContext);
         return false;
     }
-    const AVCodec* codec = nullptr;
+    AVCodec* codec = nullptr;
     AVCodecParameters* codecParameters = nullptr;
     int audioStreamIndex = av_find_best_stream(formatContext, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
     if (audioStreamIndex >= 0) {
@@ -935,7 +935,8 @@ bool Audio::LoadPcmwav2Char(const char* filename, int32_t* sampling_rate)
     speech_len = (n_file_len) / 2;
     speech_char = (char *)malloc(n_file_len);
     memset(speech_char, 0, n_file_len);
-    fread(speech_char, sizeof(int16_t), n_file_len/2, fp);
+    size_t read_count = fread(speech_char, sizeof(int16_t), n_file_len/2, fp);
+    (void)read_count; // suppress unused variable warning
     fclose(fp);
     
     return true;
@@ -962,7 +963,8 @@ bool Audio::LoadOthers2Char(const char* filename)
     speech_len = n_file_len;
     speech_char = (char *)malloc(n_file_len);
     memset(speech_char, 0, n_file_len);
-    fread(speech_char, 1, n_file_len, fp);
+    size_t read_count = fread(speech_char, 1, n_file_len, fp);
+    (void)read_count; // suppress unused variable warning
     fclose(fp);
     
     return true;
