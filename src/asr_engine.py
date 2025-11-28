@@ -116,16 +116,21 @@ class ASREngine:
         # For streaming mode (is_finished=False), return online results
         if not is_finished:
             # Online ASR processing (streaming results)
+            # Process accumulated audio with online model
             if self.online_asr_model and len(self.audio_buffer) > 0:
-                # Get accumulated audio
+                # Get all accumulated audio so far
                 accumulated_audio = np.concatenate(self.audio_buffer)
                 
-                # Extract features for online model
+                # Extract features for accumulated audio
                 features = self.online_asr_model.extract_features(accumulated_audio)
                 
                 # Run online inference
                 if len(features) > 0:
                     text = self.online_asr_model.infer(features)
+                    
+                    # Log for debugging
+                    from loguru import logger
+                    logger.debug(f"Online ASR result: '{text}' (audio: {len(accumulated_audio)} samples, features: {features.shape})")
                     
                     if text and text.strip():
                         # Create intermediate result (2pass-online)

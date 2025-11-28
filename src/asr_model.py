@@ -249,11 +249,24 @@ class OnlineASRModel:
             inputs['acoustic_embeds_len'] = np.array([1], dtype=np.int32)
         
         # Add decoder cache if required (usually for streaming decoder)
+        # Get cache shape from model input if available
         for i in range(16):
             cache_name = f'in_cache_{i}'
             if cache_name in self.decoder_input_names:
-                # Create zero cache if not exists
-                inputs[cache_name] = np.zeros((1, 512, 10), dtype=np.float32)
+                # Try to get shape from model
+                cache_shape = None
+                for inp in self.decoder_session.get_inputs():
+                    if inp.name == cache_name:
+                        cache_shape = inp.shape
+                        break
+                
+                if cache_shape:
+                    # Replace dynamic dims with defaults
+                    cache_shape = [1 if (isinstance(s, str) or s < 0) else s for s in cache_shape]
+                    inputs[cache_name] = np.zeros(cache_shape, dtype=np.float32)
+                else:
+                    # Default cache shape
+                    inputs[cache_name] = np.zeros((1, 512, 10), dtype=np.float32)
         
         # Run decoder
         outputs = self.decoder_session.run(self.decoder_output_names, inputs)
@@ -282,14 +295,19 @@ class OnlineASRModel:
         Returns:
             Recognized text
         """
+        from loguru import logger
+        
         # Encode
         encoder_output, self.encoder_cache = self.encode(features)
+        logger.debug(f"Online encoder output: shape={encoder_output.shape}")
         
         # Decode
         token_ids = self.decode(encoder_output)
+        logger.debug(f"Online decoder tokens: {len(token_ids)} tokens, first 20: {token_ids[:20]}")
         
         # Convert to text
         text = self.tokens_to_text(token_ids)
+        logger.debug(f"Online ASR text: '{text}'")
         
         return text
     

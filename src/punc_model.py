@@ -61,13 +61,39 @@ class PunctuationModel:
         if not text or len(text) == 0:
             return text
         
-        # For simplicity, if model inference is complex,
-        # we can implement a simple rule-based approach here
-        # or implement full ONNX inference if needed
+        # Simple rule-based punctuation for Chinese text
+        # This is a fallback until full ONNX inference is implemented
+        result = []
+        chars = list(text)
         
-        # TODO: Implement full ONNX inference for punctuation model
-        # For now, return text as-is
-        return text
+        for i, char in enumerate(chars):
+            result.append(char)
+            
+            # Add comma every 3-5 characters (simple heuristic)
+            if i > 0 and (i + 1) % 4 == 0 and i < len(chars) - 1:
+                # Check if it's a good place for comma
+                if char not in '，。？！、：；':
+                    result.append('，')
+        
+        # Add period at the end if not already punctuated
+        if len(result) > 0 and result[-1] not in '，。？！、：；':
+            result[-1] = result[-1]
+            result.append('。')
+        
+        return ''.join(result)
+    
+    def infer_onnx(self, text: str) -> str:
+        """Run ONNX inference for punctuation (TODO)
+        
+        Args:
+            text: Input text without punctuation
+            
+        Returns:
+            Text with punctuation
+        """
+        # TODO: Implement proper ONNX inference
+        # For now, use rule-based approach
+        return self.add_punctuation(text)
     
     def infer(self, text: str) -> str:
         """Run punctuation model inference
