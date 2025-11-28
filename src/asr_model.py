@@ -441,7 +441,7 @@ class OnlineASRModel:
         logger.debug(f"Online encoder output: hidden shape={encoder_hidden.shape}, alphas shape={encoder_alphas.shape}")
         
         # CIF search to generate acoustic_embeds
-        acoustic_embeds = self._cif_search(encoder_hidden, encoder_alphas, is_finished=is_finished)
+        acoustic_embeds = self._cif_search(encoder_hidden, encoder_alphas, is_final=is_finished)
         logger.debug(f"CIF search generated acoustic_embeds: shape={acoustic_embeds.shape}")
         
         if len(acoustic_embeds) == 0:
