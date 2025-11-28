@@ -123,17 +123,9 @@ class ASREngine:
             # Use frontend's streaming feature extraction (maintains internal buffer)
             logger.debug(f"Checking online ASR: model={self.online_asr_model is not None}, chunk_len={len(audio_chunk)}")
             if self.online_asr_model and len(audio_chunk) > 0:
-                # Add chunk to frontend buffer
-                self.online_asr_model.frontend.add_audio(audio_chunk)
-                logger.debug(f"Added {len(audio_chunk)} samples to frontend buffer")
-                
-                # Extract features from frontend buffer (streaming mode)
-                features, consumed = self.online_asr_model.frontend.extract_feat_streaming(return_samples=True)
-                logger.debug(f"Extracted features from stream: shape={features.shape if len(features) > 0 else 'empty'}, consumed={consumed} samples")
-                
-                # Run online inference (this maintains encoder cache internally)
-                if len(features) > 0:
-                    text = self.online_asr_model.infer(features, is_finished=False)
+                # Call Forward method directly (like C++ implementation)
+                text = self.online_asr_model.forward(audio_chunk, input_finished=False)
+                logger.debug(f"Online ASR Forward result: text='{text}', len={len(text) if text else 0}")
                     
                     # Log for debugging
                     logger.debug(f"Online ASR chunk result: text='{text}', len={len(text) if text else 0}")
@@ -162,10 +154,15 @@ class ASREngine:
                 if self.offline_asr_model:
                     features = self.offline_asr_model.extract_features(complete_audio)
                     text = self.offline_asr_model.infer(features)
+                    logger.debug(f"Offline ASR result (before punc): '{text}'")
                     
                     # Add punctuation
                     if self.punc_model and text:
+                        text_before_punc = text
                         text = self.punc_model.infer(text)
+                        logger.debug(f"Punctuation applied: '{text_before_punc}' -> '{text}'")
+                    elif not self.punc_model:
+                        logger.warning("Punctuation model not available, skipping punctuation")
                     
                     if text and text.strip():
                         # Create final result (2pass-offline)

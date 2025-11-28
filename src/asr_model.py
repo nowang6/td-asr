@@ -106,9 +106,28 @@ class OnlineASRModel:
         self.tail_alphas = 0.45   # Default tail alpha value
         self.chunk_size = [5, 10, 5]  # Default chunk size [pre, main, suf]
         
+        # Feature dimensions
+        self.feat_dims = self.frontend.lfr_m * self.frontend.n_mels  # 7 * 80 = 560
+        self.encoder_size = 512  # Default encoder hidden size
+        self.sqrt_factor = np.sqrt(self.encoder_size)
+        
         # CIF cache
         self.hidden_cache = []  # List of hidden state vectors
         self.alphas_cache = []  # List of alpha values
+        
+        # LFR and feature cache (like C++ lfr_splice_cache_ and feats_cache_)
+        self.lfr_splice_cache = []  # LFR splice cache
+        self.feats_cache = []  # Features cache for overlap
+        self.reserve_waveforms = np.array([], dtype=np.float32)  # Reserve waveforms
+        self.start_idx_cache = 0  # Position index cache
+        
+        # State flags
+        self.is_first_chunk = True
+        self.is_last_chunk = False
+        
+        # Frame parameters
+        self.frame_sample_length = int(self.frontend.frame_length * self.frontend.fs / 1000)
+        self.frame_shift_sample_length = int(self.frontend.frame_shift * self.frontend.fs / 1000)
         
         # Initialize decoder cache (for streaming)
         self.decoder_cache = self._init_decoder_cache()
@@ -230,29 +249,146 @@ class OnlineASRModel:
         return cache
     
     def reset(self):
-        """Reset ASR state"""
-        self.frontend.reset()
+        """Reset ASR state (like C++ Reset)"""
+        self.start_idx_cache = 0
+        self.is_first_chunk = True
+        self.is_last_chunk = False
         self.hidden_cache = []
         self.alphas_cache = []
+        self.lfr_splice_cache = []
+        self.feats_cache = []
+        self.reserve_waveforms = np.array([], dtype=np.float32)
         self.decoder_cache = self._init_decoder_cache()
     
-    def extract_features(self, audio: np.ndarray) -> np.ndarray:
-        """Extract features for ASR
+    def reset_cache(self):
+        """Reset cache (like C++ ResetCache)"""
+        self.reserve_waveforms = np.array([], dtype=np.float32)
+        self.lfr_splice_cache = []
+    
+    def _fbank_kaldi(self, sample_rate: int, waves: np.ndarray) -> np.ndarray:
+        """Extract fbank features (like C++ FbankKaldi)
         
         Args:
-            audio: Audio waveform
+            sample_rate: Sample rate
+            waves: Audio waveform
             
         Returns:
-            Features with shape [n_frames, 560]
+            Fbank features [n_frames, n_mels]
         """
-        # Extract fbank features
-        features = self.frontend.extract_feat(audio)
+        return self.frontend.extract_fbank(waves)
+    
+    def _online_lfr_cmvn(self, wav_feats: list, input_finished: bool) -> int:
+        """Apply LFR and CMVN (like C++ OnlineLfrCmvn)
         
-        # Apply CMVN
-        if len(features) > 0:
-            features = apply_cmvn(features, self.cmvn)
+        This method modifies wav_feats in-place (converts list to numpy array with LFR applied).
         
-        return features
+        Args:
+            wav_feats: Input fbank features as list of lists [T, n_mels] (will be modified)
+            input_finished: Whether this is the final chunk
+            
+        Returns:
+            lfr_splice_frame_idx: Frame index for cache
+        """
+        T = len(wav_feats)
+        T_lrf = int(np.ceil((T - (self.frontend.lfr_m - 1) / 2) / self.frontend.lfr_n))
+        lfr_splice_frame_idx = T_lrf
+        
+        out_feats = []
+        for i in range(T_lrf):
+            if self.frontend.lfr_m <= T - i * self.frontend.lfr_n:
+                # Concatenate lfr_m frames
+                p = []
+                for j in range(self.frontend.lfr_m):
+                    p.extend(wav_feats[i * self.frontend.lfr_n + j])
+                out_feats.append(p)
+            else:
+                if input_finished:
+                    # Padding for final chunk
+                    num_padding = self.frontend.lfr_m - (T - i * self.frontend.lfr_n)
+                    p = []
+                    for j in range(T - i * self.frontend.lfr_n):
+                        p.extend(wav_feats[i * self.frontend.lfr_n + j])
+                    # Pad with last frame
+                    for j in range(num_padding):
+                        p.extend(wav_feats[-1])
+                    out_feats.append(p)
+                else:
+                    lfr_splice_frame_idx = i
+                    break
+        
+        lfr_splice_frame_idx = min(T - 1, lfr_splice_frame_idx * self.frontend.lfr_n)
+        
+        # Update cache
+        self.lfr_splice_cache = wav_feats[lfr_splice_frame_idx:]
+        
+        # Apply CMVN and convert to numpy array
+        if len(out_feats) > 0:
+            out_feats = np.array(out_feats, dtype=np.float32)
+            # Apply CMVN (means_list and vars_list from self.cmvn)
+            means = self.cmvn[0]  # [feat_dim]
+            vars_ = self.cmvn[1]  # [feat_dim]
+            out_feats = (out_feats + means) * vars_
+            # Replace wav_feats content
+            wav_feats[:] = out_feats.tolist()
+        else:
+            wav_feats.clear()
+        
+        return lfr_splice_frame_idx
+    
+    def _get_pos_emb(self, wav_feats: np.ndarray, timesteps: int, feat_dim: int):
+        """Add position encoding (like C++ GetPosEmb)
+        
+        Args:
+            wav_feats: Input features [timesteps, feat_dim] (will be modified in-place)
+            timesteps: Number of timesteps
+            feat_dim: Feature dimension
+        """
+        start_idx = self.start_idx_cache
+        self.start_idx_cache += timesteps
+        mm = self.start_idx_cache
+        
+        scale = -0.0330119726594128
+        tmp = np.zeros(mm * feat_dim, dtype=np.float32)
+        
+        for i in range(feat_dim // 2):
+            tmptime = np.exp(i * scale)
+            for j in range(mm):
+                sin_idx = j * feat_dim + i
+                cos_idx = j * feat_dim + i + feat_dim // 2
+                coe = tmptime * (j + 1)
+                tmp[sin_idx] = np.sin(coe)
+                tmp[cos_idx] = np.cos(coe)
+        
+        # Add position encoding to current features
+        for i in range(start_idx, start_idx + timesteps):
+            for j in range(feat_dim):
+                wav_feats[i - start_idx, j] += tmp[i * feat_dim + j]
+    
+    def _add_overlap_chunk(self, wav_feats: np.ndarray, input_finished: bool) -> np.ndarray:
+        """Add overlap chunk (like C++ AddOverlapChunk)
+        
+        Args:
+            wav_feats: Input features [T, feat_dim]
+            input_finished: Whether this is the final chunk
+            
+        Returns:
+            Features with overlap added
+        """
+        # Insert feats_cache at the beginning
+        if len(self.feats_cache) > 0:
+            wav_feats = np.concatenate([np.array(self.feats_cache), wav_feats], axis=0)
+        
+        if input_finished:
+            self.feats_cache = wav_feats[-self.chunk_size[0]:].tolist()
+            if not self.is_last_chunk:
+                padding_length = sum(self.chunk_size) - len(wav_feats)
+                if padding_length > 0:
+                    padding = np.zeros((padding_length, self.feat_dims), dtype=np.float32)
+                    wav_feats = np.concatenate([wav_feats, padding], axis=0)
+        else:
+            self.feats_cache = wav_feats[-self.chunk_size[0] - self.chunk_size[2]:].tolist()
+        
+        return wav_feats
     
     def encode(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Run encoder and get hidden states and alpha values
@@ -424,40 +560,177 @@ class OnlineASRModel:
         
         return token_ids
     
-    def infer(self, features: np.ndarray, is_finished: bool = False) -> str:
-        """Run full inference pipeline
+    def extract_feats(self, sample_rate: int, waves: np.ndarray, input_finished: bool) -> np.ndarray:
+        """Extract features with LFR cache management (like C++ ExtractFeats)
+        
+        This method modifies wav_feats in-place and returns it.
         
         Args:
-            features: Input features with shape [n_frames, 560]
-            is_finished: Whether this is the final chunk
+            sample_rate: Sample rate
+            waves: Audio waveform (will be modified)
+            input_finished: Whether this is the final chunk
+            
+        Returns:
+            Features with shape [n_lfr_frames, feat_dims] (empty if not enough frames)
+        """
+        # Extract fbank features
+        wav_feats = self._fbank_kaldi(sample_rate, waves)
+        
+        if len(wav_feats) == 0:
+            if input_finished and len(self.lfr_splice_cache) > 0:
+                # Process remaining cache on final chunk
+                wav_feats = np.array(self.lfr_splice_cache)
+                self._online_lfr_cmvn(wav_feats, input_finished)
+                if input_finished:
+                    self.reset_cache()
+                return wav_feats
+            return np.zeros((0, self.feat_dims), dtype=np.float32)
+        
+        # Merge with reserve waveforms if any
+        if len(self.reserve_waveforms) > 0:
+            waves = np.concatenate([self.reserve_waveforms, waves])
+        
+        # Initialize LFR cache if empty
+        if len(self.lfr_splice_cache) == 0:
+            pad_frames = (self.frontend.lfr_m - 1) // 2
+            if len(wav_feats) > 0:
+                self.lfr_splice_cache = [wav_feats[0].copy() for _ in range(pad_frames)]
+        
+        # Check if we have enough frames
+        total_frames = len(wav_feats) + len(self.lfr_splice_cache)
+        
+        if total_frames >= self.frontend.lfr_m:
+            # Merge cache with new features (as list for in-place modification)
+            all_fbank = self.lfr_splice_cache + wav_feats.tolist()
+            
+            # Apply LFR and CMVN (modifies all_fbank in-place)
+            frame_from_waves = (len(waves) - self.frame_sample_length) // self.frame_shift_sample_length + 1
+            minus_frame = 0 if len(self.reserve_waveforms) > 0 else (self.frontend.lfr_m - 1) // 2
+            lfr_splice_frame_idx = self._online_lfr_cmvn(all_fbank, input_finished)
+            
+            # Calculate reserve waveforms
+            reserve_frame_idx = abs(lfr_splice_frame_idx - minus_frame)
+            sample_length = (frame_from_waves - 1) * self.frame_shift_sample_length + self.frame_sample_length
+            self.reserve_waveforms = waves[reserve_frame_idx * self.frame_shift_sample_length:
+                                          frame_from_waves * self.frame_shift_sample_length].copy()
+            
+            if input_finished:
+                self.reset_cache()
+            
+            # Convert back to numpy array
+            return np.array(all_fbank, dtype=np.float32) if len(all_fbank) > 0 else np.zeros((0, self.feat_dims), dtype=np.float32)
+        else:
+            # Not enough frames, cache them
+            self.lfr_splice_cache.extend(wav_feats.tolist())
+            reserve_start = max(0, self.frame_sample_length - self.frame_shift_sample_length)
+            self.reserve_waveforms = waves[reserve_start:].copy()
+            return np.zeros((0, self.feat_dims), dtype=np.float32)
+    
+    def forward(self, audio_chunk: np.ndarray, input_finished: bool = False) -> str:
+        """Forward pass (like C++ ParaformerOnline::Forward)
+        
+        Args:
+            audio_chunk: Audio waveform chunk
+            input_finished: Whether this is the final chunk
             
         Returns:
             Recognized text
         """
         from loguru import logger
         
-        # Encode to get hidden states and alphas
-        encoder_hidden, encoder_alphas = self.encode(features)
-        logger.debug(f"Online encoder output: hidden shape={encoder_hidden.shape}, alphas shape={encoder_alphas.shape}")
+        result = ""
         
-        # CIF search to generate acoustic_embeds
-        acoustic_embeds = self._cif_search(encoder_hidden, encoder_alphas, is_final=is_finished)
-        logger.debug(f"CIF search generated acoustic_embeds: shape={acoustic_embeds.shape}")
+        try:
+            # Handle short final chunk
+            if len(audio_chunk) < 16 * 60 and input_finished and not self.is_first_chunk:
+                self.is_last_chunk = True
+                if len(self.feats_cache) > 0:
+                    wav_feats = np.array(self.feats_cache)
+                    result = self.forward_chunk(wav_feats, self.is_last_chunk)
+                    self.reset_cache()
+                    self.reset()
+                    return result
+            
+            if self.is_first_chunk:
+                self.is_first_chunk = False
+            
+            # Extract features
+            wav_feats = self.extract_feats(self.frontend.fs, audio_chunk, input_finished)
+            
+            if len(wav_feats) == 0:
+                return result
+            
+            # Apply sqrt factor
+            wav_feats = wav_feats * self.sqrt_factor
+            
+            # Add position encoding
+            self._get_pos_emb(wav_feats, len(wav_feats), self.feat_dims)
+            
+            if input_finished:
+                if len(wav_feats) + self.chunk_size[2] <= self.chunk_size[1]:
+                    self.is_last_chunk = True
+                    wav_feats = self._add_overlap_chunk(wav_feats, input_finished)
+                    result = self.forward_chunk(wav_feats, self.is_last_chunk)
+                else:
+                    # Split into first and last chunk
+                    first_chunk = wav_feats.copy()
+                    first_chunk = self._add_overlap_chunk(first_chunk, input_finished)
+                    str_first_chunk = self.forward_chunk(first_chunk, False)
+                    
+                    self.is_last_chunk = True
+                    last_chunk = wav_feats[-(len(wav_feats) + self.chunk_size[2] - self.chunk_size[1]):]
+                    last_chunk = self._add_overlap_chunk(last_chunk, input_finished)
+                    str_last_chunk = self.forward_chunk(last_chunk, self.is_last_chunk)
+                    
+                    result = str_first_chunk + str_last_chunk
+                
+                self.reset_cache()
+                self.reset()
+                return result
+            else:
+                wav_feats = self._add_overlap_chunk(wav_feats, input_finished)
+            
+            result = self.forward_chunk(wav_feats, self.is_last_chunk)
+            
+            if input_finished:
+                self.reset_cache()
+                self.reset()
+        
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Error in Forward: {e}")
+        
+        return result
+    
+    def forward_chunk(self, chunk_feats: np.ndarray, input_finished: bool) -> str:
+        """Forward chunk (like C++ ForwardChunk)
+        
+        Args:
+            chunk_feats: Input features [T, feat_dims]
+            input_finished: Whether this is the final chunk
+            
+        Returns:
+            Recognized text
+        """
+        if len(chunk_feats) == 0:
+            return ""
+        
+        # Encode
+        encoder_hidden, encoder_alphas = self.encode(chunk_feats)
+        
+        # CIF search
+        acoustic_embeds = self._cif_search(encoder_hidden, encoder_alphas, is_final=input_finished)
         
         if len(acoustic_embeds) == 0:
             return ""
         
-        # Prepare decoder inputs
-        encoder_hidden_batch = encoder_hidden.astype(np.float32)[np.newaxis, :, :]  # [1, T, hidden_dim]
-        encoder_lens = np.array([encoder_hidden.shape[0]], dtype=np.int32)
-        
         # Decode
+        encoder_hidden_batch = encoder_hidden.astype(np.float32)[np.newaxis, :, :]
+        encoder_lens = np.array([encoder_hidden.shape[0]], dtype=np.int32)
         token_ids = self.decode(encoder_hidden_batch, acoustic_embeds, encoder_lens)
-        logger.debug(f"Online decoder tokens: {len(token_ids)} tokens, first 20: {token_ids[:20]}")
         
         # Convert to text
         text = self.tokens_to_text(token_ids)
-        logger.debug(f"Online ASR text: '{text}'")
         
         return text
     

@@ -61,6 +61,10 @@ class WavFrontendOnline:
         # Audio buffer for streaming
         self.audio_buffer = np.array([], dtype=np.float32)
         
+        # LFR cache for streaming (similar to C++ lfr_splice_cache_)
+        self.lfr_splice_cache = []
+        self.reserve_waveforms = np.array([], dtype=np.float32)
+        
     def _create_mel_filters(self) -> np.ndarray:
         """Create mel filterbank matrix"""
         # Frequency points
@@ -202,52 +206,128 @@ class WavFrontendOnline:
         """
         self.audio_buffer = np.concatenate([self.audio_buffer, audio_chunk])
     
-    def extract_feat_streaming(self, return_samples: bool = False) -> tuple:
+    def extract_feat_streaming(self, return_samples: bool = False, is_finished: bool = False) -> tuple:
         """Extract features from buffered audio for streaming
         
-        This extracts features from the buffer and keeps remaining samples
-        for the next chunk.
+        This implements the C++ ExtractFeats logic with LFR cache management.
+        Simplified version that accumulates enough audio before extracting features.
         
         Args:
             return_samples: If True, return number of consumed samples
+            is_finished: Whether this is the final chunk
             
         Returns:
             Tuple of (features, consumed_samples)
         """
+        # Merge with reserve waveforms if any
+        if len(self.reserve_waveforms) > 0:
+            self.audio_buffer = np.concatenate([self.reserve_waveforms, self.audio_buffer])
+            self.reserve_waveforms = np.array([], dtype=np.float32)
+        
         if len(self.audio_buffer) == 0:
+            if is_finished and len(self.lfr_splice_cache) > 0:
+                # Process remaining cache on final chunk
+                features = self.apply_lfr(np.array(self.lfr_splice_cache))
+                self.lfr_splice_cache = []
+                return features, 0
             return np.zeros((0, self.n_mels * self.lfr_m), dtype=np.float32), 0
         
-        # Calculate how many frames we can extract
-        max_samples = len(self.audio_buffer)
-        n_frames = (max_samples - self.frame_len_samples) // self.frame_shift_samples + 1
+        # Extract fbank features from current buffer
+        fbank_feats = self.extract_fbank(self.audio_buffer)
         
-        if n_frames <= 0:
+        if len(fbank_feats) == 0:
             return np.zeros((0, self.n_mels * self.lfr_m), dtype=np.float32), 0
         
-        # Calculate how many complete LFR frames we can extract
-        n_lfr_frames = (n_frames - self.lfr_m) // self.lfr_n
-        if n_lfr_frames <= 0:
+        # Initialize LFR cache if empty (pad with first frame)
+        if len(self.lfr_splice_cache) == 0:
+            pad_frames = (self.lfr_m - 1) // 2
+            if len(fbank_feats) > 0:
+                self.lfr_splice_cache = [fbank_feats[0].copy() for _ in range(pad_frames)]
+        
+        # Check if we have enough frames to process LFR
+        total_frames = len(fbank_feats) + len(self.lfr_splice_cache)
+        
+        if total_frames >= self.lfr_m or is_finished:
+            # Merge cache with new features
+            all_fbank = np.array(self.lfr_splice_cache + fbank_feats.tolist())
+            
+            # Apply LFR (handles padding for final chunk)
+            if is_finished:
+                # For final chunk, use apply_lfr which handles padding
+                lfr_features = self.apply_lfr(all_fbank)
+                consumed_samples = len(self.audio_buffer)
+                self.audio_buffer = np.array([], dtype=np.float32)
+                self.lfr_splice_cache = []
+            else:
+                # For streaming, calculate how many LFR frames we can generate
+                # LFR formula: T_lrf = ceil((T - (lfr_m - 1) / 2) / lfr_n)
+                T = len(all_fbank)
+                T_lrf = int(np.ceil((T - (self.lfr_m - 1) / 2) / self.lfr_n))
+                
+                if T_lrf > 0:
+                    # Generate LFR features
+                    lfr_features = []
+                    for i in range(T_lrf):
+                        start = i * self.lfr_n
+                        end = start + self.lfr_m
+                        if end <= T:
+                            # Concatenate frames
+                            concat_frame = all_fbank[start:end].flatten()
+                            lfr_features.append(concat_frame)
+                    
+                    if len(lfr_features) > 0:
+                        lfr_features = np.array(lfr_features, dtype=np.float32)
+                        
+                        # Calculate frame index for cache (last processed frame)
+                        lfr_splice_frame_idx = min(T - 1, (T_lrf - 1) * self.lfr_n + self.lfr_m)
+                        
+                        # Update cache with remaining frames
+                        if lfr_splice_frame_idx < T:
+                            self.lfr_splice_cache = all_fbank[lfr_splice_frame_idx:].tolist()
+                        else:
+                            self.lfr_splice_cache = []
+                        
+                        # Calculate consumed samples (approximate)
+                        # Each LFR frame consumes lfr_n frames
+                        consumed_frames = T_lrf * self.lfr_n
+                        consumed_samples = (consumed_frames - 1) * self.frame_shift_samples + self.frame_len_samples
+                        consumed_samples = min(consumed_samples, len(self.audio_buffer))
+                        
+                        # Reserve waveforms for overlap
+                        reserve_start = max(0, self.frame_len_samples - self.frame_shift_samples)
+                        if consumed_samples < len(self.audio_buffer):
+                            self.reserve_waveforms = self.audio_buffer[reserve_start:consumed_samples]
+                        self.audio_buffer = self.audio_buffer[consumed_samples:]
+                    else:
+                        # Not enough frames yet, cache them
+                        self.lfr_splice_cache.extend(fbank_feats.tolist())
+                        self.reserve_waveforms = self.audio_buffer[max(0, self.frame_len_samples - self.frame_shift_samples):]
+                        self.audio_buffer = np.array([], dtype=np.float32)
+                        lfr_features = np.zeros((0, self.n_mels * self.lfr_m), dtype=np.float32)
+                        consumed_samples = 0
+                else:
+                    # Not enough frames yet, cache them
+                    self.lfr_splice_cache.extend(fbank_feats.tolist())
+                    self.reserve_waveforms = self.audio_buffer[max(0, self.frame_len_samples - self.frame_shift_samples):]
+                    self.audio_buffer = np.array([], dtype=np.float32)
+                    lfr_features = np.zeros((0, self.n_mels * self.lfr_m), dtype=np.float32)
+                    consumed_samples = 0
+            
+            if return_samples:
+                return lfr_features, consumed_samples
+            return lfr_features, 0
+        else:
+            # Not enough frames, cache them
+            self.lfr_splice_cache.extend(fbank_feats.tolist())
+            # Reserve waveforms for next iteration
+            reserve_start = max(0, self.frame_len_samples - self.frame_shift_samples)
+            self.reserve_waveforms = self.audio_buffer[reserve_start:]
+            self.audio_buffer = np.array([], dtype=np.float32)
             return np.zeros((0, self.n_mels * self.lfr_m), dtype=np.float32), 0
-        
-        # Calculate samples needed for these LFR frames
-        frames_needed = n_lfr_frames * self.lfr_n + self.lfr_m
-        samples_needed = (frames_needed - 1) * self.frame_shift_samples + self.frame_len_samples
-        
-        # Extract features
-        waveform = self.audio_buffer[:samples_needed]
-        features = self.extract_feat(waveform)
-        
-        # Calculate consumed samples (for complete LFR frames)
-        consumed_samples = n_lfr_frames * self.lfr_n * self.frame_shift_samples
-        
-        # Keep remaining audio in buffer
-        self.audio_buffer = self.audio_buffer[consumed_samples:]
-        
-        if return_samples:
-            return features, consumed_samples
-        return features, 0
     
     def reset(self) -> None:
-        """Reset audio buffer"""
+        """Reset audio buffer and caches"""
         self.audio_buffer = np.array([], dtype=np.float32)
+        self.lfr_splice_cache = []
+        self.reserve_waveforms = np.array([], dtype=np.float32)
 
