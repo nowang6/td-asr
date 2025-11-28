@@ -235,10 +235,60 @@ class OnlineASRModel(ModelLoader):
     
     def reset(self):
         """Reset model state"""
-        # Encoder states (cache)
+        # Encoder states (cache) - initialize based on model inputs
         self.encoder_cache = None
+        self._init_encoder_cache()
         # Decoder states
         self.decoder_cache = None
+        self._init_decoder_cache()
+    
+    def _init_encoder_cache(self):
+        """Initialize encoder cache based on model input requirements"""
+        encoder_inputs = self.encoder_session.get_inputs()
+        cache_list = []
+        for inp in encoder_inputs:
+            if 'cache' in inp.name.lower() or 'in_cache' in inp.name:
+                # Initialize cache with zeros based on shape
+                shape = []
+                for dim in inp.shape:
+                    if isinstance(dim, str):
+                        # Dynamic dimension, use a reasonable default
+                        # For encoder cache, typically small batch size
+                        shape.append(1)
+                    elif dim is None or dim < 0:
+                        shape.append(1)
+                    else:
+                        shape.append(int(dim))
+                cache = np.zeros(shape, dtype=np.float32)
+                cache_list.append(cache)
+                logger.debug(f"Initialized encoder cache {inp.name} with shape {shape}")
+        if cache_list:
+            self.encoder_cache = cache_list if len(cache_list) > 1 else cache_list[0]
+        else:
+            self.encoder_cache = None
+    
+    def _init_decoder_cache(self):
+        """Initialize decoder cache based on model input requirements"""
+        decoder_inputs = self.decoder_session.get_inputs()
+        cache_list = []
+        for inp in decoder_inputs:
+            if 'cache' in inp.name.lower() or 'in_cache' in inp.name:
+                # Initialize cache with zeros based on shape
+                shape = []
+                for dim in inp.shape:
+                    if isinstance(dim, str):
+                        shape.append(1)
+                    elif dim is None or dim < 0:
+                        shape.append(1)
+                    else:
+                        shape.append(int(dim))
+                cache = np.zeros(shape, dtype=np.float32)
+                cache_list.append(cache)
+                logger.debug(f"Initialized decoder cache {inp.name} with shape {shape}")
+        if cache_list:
+            self.decoder_cache = cache_list if len(cache_list) > 1 else cache_list[0]
+        else:
+            self.decoder_cache = None
     
     def infer(
         self,
@@ -257,34 +307,83 @@ class OnlineASRModel(ModelLoader):
         """
         # Encoder
         encoder_inputs = {}
-        encoder_inputs[self.encoder_session.get_inputs()[0].name] = features[np.newaxis, :, :].astype(np.float32)
+        encoder_inputs_info = self.encoder_session.get_inputs()
+        encoder_input_names = [inp.name for inp in encoder_inputs_info]
         
-        if self.encoder_cache is not None:
-            # Add cache if model expects it
-            if len(self.encoder_session.get_inputs()) > 1:
-                encoder_inputs[self.encoder_session.get_inputs()[1].name] = self.encoder_cache
+        # Find speech input (usually the first one or named 'speech')
+        speech_input_name = None
+        cache_input_names = []
+        for inp in encoder_inputs_info:
+            name = inp.name
+            if 'cache' in name.lower() or 'in_cache' in name:
+                cache_input_names.append(name)
+            elif 'speech' in name.lower() or speech_input_name is None:
+                speech_input_name = name
+        
+        if speech_input_name:
+            encoder_inputs[speech_input_name] = features[np.newaxis, :, :].astype(np.float32)
+        
+        # Add all cache inputs
+        if cache_input_names:
+            if self.encoder_cache is None:
+                # Initialize cache if not done
+                self._init_encoder_cache()
+            
+            if isinstance(self.encoder_cache, list):
+                # Multiple cache inputs
+                for i, cache_name in enumerate(cache_input_names):
+                    if i < len(self.encoder_cache):
+                        encoder_inputs[cache_name] = self.encoder_cache[i]
+            elif self.encoder_cache is not None:
+                # Single cache input (shouldn't happen with multiple cache names, but handle it)
+                if len(cache_input_names) == 1:
+                    encoder_inputs[cache_input_names[0]] = self.encoder_cache
         
         encoder_outputs = self.encoder_session.run(None, encoder_inputs)
         
-        # Update cache
+        # Update cache from outputs
         if len(encoder_outputs) > 1:
-            self.encoder_cache = encoder_outputs[1]
+            # Find cache outputs (usually after the main output)
+            cache_outputs = []
+            for i in range(1, len(encoder_outputs)):
+                cache_outputs.append(encoder_outputs[i])
+            if cache_outputs:
+                self.encoder_cache = cache_outputs if len(cache_outputs) > 1 else cache_outputs[0]
         
         encoder_out = encoder_outputs[0]
         
         # Decoder
         decoder_inputs = {}
-        decoder_inputs[self.decoder_session.get_inputs()[0].name] = encoder_out
+        decoder_input_names = [inp.name for inp in self.decoder_session.get_inputs()]
         
+        # Find encoder output input (usually the first one)
+        encoder_out_input_name = decoder_input_names[0]
+        decoder_inputs[encoder_out_input_name] = encoder_out
+        
+        # Add decoder cache if exists
         if self.decoder_cache is not None:
-            if len(self.decoder_session.get_inputs()) > 1:
-                decoder_inputs[self.decoder_session.get_inputs()[1].name] = self.decoder_cache
+            if isinstance(self.decoder_cache, list):
+                cache_idx = 0
+                for name in decoder_input_names[1:]:  # Skip first (encoder_out)
+                    if 'cache' in name.lower() or 'in_cache' in name:
+                        if cache_idx < len(self.decoder_cache):
+                            decoder_inputs[name] = self.decoder_cache[cache_idx]
+                            cache_idx += 1
+            else:
+                for name in decoder_input_names[1:]:
+                    if 'cache' in name.lower() or 'in_cache' in name:
+                        decoder_inputs[name] = self.decoder_cache
+                        break
         
         decoder_outputs = self.decoder_session.run(None, decoder_inputs)
         
-        # Update decoder cache
+        # Update decoder cache from outputs
         if len(decoder_outputs) > 1:
-            self.decoder_cache = decoder_outputs[1]
+            cache_outputs = []
+            for i in range(1, len(decoder_outputs)):
+                cache_outputs.append(decoder_outputs[i])
+            if cache_outputs:
+                self.decoder_cache = cache_outputs if len(cache_outputs) > 1 else cache_outputs[0]
         
         # Decode tokens to text
         logits = decoder_outputs[0]  # Shape: [B, T, vocab_size]
