@@ -32,8 +32,7 @@ async def root():
     })
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_handler(websocket: WebSocket):
     """WebSocket endpoint for real-time ASR
     
     Protocol:
@@ -206,6 +205,20 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1011, reason=str(e))
         except:
             pass
+
+
+# Register WebSocket endpoints for both root and /ws paths
+# C++ client uses root path, others may use /ws
+@app.websocket("/")
+async def websocket_endpoint_root(websocket: WebSocket):
+    """WebSocket endpoint at root path (for C++ client compatibility)"""
+    await websocket_handler(websocket)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint_ws(websocket: WebSocket):
+    """WebSocket endpoint at /ws path"""
+    await websocket_handler(websocket)
 
 
 @click.command()
