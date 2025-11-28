@@ -101,8 +101,11 @@ class OnlineASRModel:
         logger.debug(f"Online ASR Decoder inputs: {self.decoder_input_names}")
         logger.debug(f"Online ASR Decoder outputs: {self.decoder_output_names}")
         
-        # Initialize encoder cache
+        # Initialize encoder cache (though this model doesn't use it)
         self.encoder_cache = self._init_encoder_cache()
+        
+        # Initialize decoder cache (for streaming)
+        self.decoder_cache = self._init_decoder_cache()
         
     def _init_encoder_cache(self) -> Dict[str, np.ndarray]:
         """Initialize encoder cache for streaming
@@ -138,10 +141,31 @@ class OnlineASRModel:
         
         return cache
     
+    def _init_decoder_cache(self) -> Dict[str, np.ndarray]:
+        """Initialize decoder cache for streaming
+        
+        Returns:
+            Dictionary of decoder cache tensors
+        """
+        cache = {}
+        for i in range(16):
+            cache_name = f'in_cache_{i}'
+            if cache_name in self.decoder_input_names:
+                # Try to get shape from model
+                for inp in self.decoder_session.get_inputs():
+                    if inp.name == cache_name:
+                        shape = inp.shape
+                        # Replace dynamic dims
+                        shape = [1 if (isinstance(s, str) or s < 0) else s for s in shape]
+                        cache[cache_name] = np.zeros(shape, dtype=np.float32)
+                        break
+        return cache
+    
     def reset(self):
         """Reset ASR state"""
         self.frontend.reset()
         self.encoder_cache = self._init_encoder_cache()
+        self.decoder_cache = self._init_decoder_cache()
     
     def extract_features(self, audio: np.ndarray) -> np.ndarray:
         """Extract features for ASR
@@ -197,20 +221,12 @@ class OnlineASRModel:
             encoder_output = encoder_output[0]  # [T', hidden_dim]
         
         # Update cache from outputs
-        updated_cache = {}
-        for i, output_name in enumerate(self.encoder_output_names):
-            if 'cache' in output_name.lower():
-                # Map output cache to input cache
-                # e.g., 'out_cache0' -> 'in_cache0' or 'cache_0' -> 'in_cache_0'
-                if output_name.startswith('out_'):
-                    input_name = output_name.replace('out_', 'in_')
-                else:
-                    input_name = 'in_' + output_name
-                updated_cache[input_name] = outputs[i]
+        # Note: This encoder doesn't output cache, cache is maintained in decoder
+        updated_cache = self.encoder_cache  # Keep existing cache
         
-        # If no cache outputs found, keep old cache
-        if not updated_cache:
-            updated_cache = self.encoder_cache
+        from loguru import logger
+        logger.debug(f"Encoder outputs: {self.encoder_output_names}")
+        logger.debug(f"Encoder cache maintained (no output cache in this model)")
         
         return encoder_output, updated_cache
     
@@ -248,28 +264,24 @@ class OnlineASRModel:
             inputs['acoustic_embeds'] = acoustic_embeds
             inputs['acoustic_embeds_len'] = np.array([1], dtype=np.int32)
         
-        # Add decoder cache if required (usually for streaming decoder)
-        # Get cache shape from model input if available
-        for i in range(16):
-            cache_name = f'in_cache_{i}'
+        # Add decoder cache from persistent state
+        for cache_name, cache_value in self.decoder_cache.items():
             if cache_name in self.decoder_input_names:
-                # Try to get shape from model
-                cache_shape = None
-                for inp in self.decoder_session.get_inputs():
-                    if inp.name == cache_name:
-                        cache_shape = inp.shape
-                        break
-                
-                if cache_shape:
-                    # Replace dynamic dims with defaults
-                    cache_shape = [1 if (isinstance(s, str) or s < 0) else s for s in cache_shape]
-                    inputs[cache_name] = np.zeros(cache_shape, dtype=np.float32)
-                else:
-                    # Default cache shape
-                    inputs[cache_name] = np.zeros((1, 512, 10), dtype=np.float32)
+                inputs[cache_name] = cache_value
         
         # Run decoder
         outputs = self.decoder_session.run(self.decoder_output_names, inputs)
+        
+        from loguru import logger
+        logger.debug(f"Decoder ran, got {len(outputs)} outputs")
+        
+        # Update decoder cache from outputs for next iteration
+        for i, name in enumerate(self.decoder_output_names):
+            if name.startswith('out_cache_'):
+                # Update cache for next iteration
+                input_cache_name = name.replace('out_cache_', 'in_cache_')
+                self.decoder_cache[input_cache_name] = outputs[i]
+                logger.debug(f"Updated decoder cache {name} -> {input_cache_name} (shape: {outputs[i].shape})")
         
         # Check if 'sample_ids' is in outputs (decoder may directly output token IDs)
         sample_ids_output = None
