@@ -94,6 +94,13 @@ class OnlineASRModel:
         self.decoder_input_names = [inp.name for inp in self.decoder_session.get_inputs()]
         self.decoder_output_names = [out.name for out in self.decoder_session.get_outputs()]
         
+        # Log model I/O for debugging
+        from loguru import logger
+        logger.debug(f"Online ASR Encoder inputs: {self.encoder_input_names}")
+        logger.debug(f"Online ASR Encoder outputs: {self.encoder_output_names}")
+        logger.debug(f"Online ASR Decoder inputs: {self.decoder_input_names}")
+        logger.debug(f"Online ASR Decoder outputs: {self.decoder_output_names}")
+        
         # Initialize encoder cache
         self.encoder_cache = self._init_encoder_cache()
         
@@ -184,14 +191,22 @@ class OnlineASRModel:
         # Run encoder
         outputs = self.encoder_session.run(self.encoder_output_names, inputs)
         
-        # Extract encoder output and updated cache
-        encoder_output = outputs[0][0]  # [T', hidden_dim]
+        # Extract encoder output (first output is usually the hidden states)
+        encoder_output = outputs[0]
+        if len(encoder_output.shape) == 3:
+            encoder_output = encoder_output[0]  # [T', hidden_dim]
         
-        # Update cache
+        # Update cache from outputs
         updated_cache = {}
         for i, output_name in enumerate(self.encoder_output_names):
-            if 'cache' in output_name:
-                updated_cache[output_name.replace('out_', 'in_')] = outputs[i]
+            if 'cache' in output_name.lower():
+                # Map output cache to input cache
+                # e.g., 'out_cache0' -> 'in_cache0' or 'cache_0' -> 'in_cache_0'
+                if output_name.startswith('out_'):
+                    input_name = output_name.replace('out_', 'in_')
+                else:
+                    input_name = 'in_' + output_name
+                updated_cache[input_name] = outputs[i]
         
         # If no cache outputs found, keep old cache
         if not updated_cache:
@@ -215,18 +230,46 @@ class OnlineASRModel:
         encoder_out = encoder_output.astype(np.float32)[np.newaxis, :, :]  # [1, T, hidden_dim]
         encoder_out_lens = np.array([encoder_output.shape[0]], dtype=np.int32)
         
-        inputs = {
-            'encoder_out': encoder_out,
-            'encoder_out_lens': encoder_out_lens,
-        }
+        # Check decoder input names to use correct naming
+        inputs = {}
+        
+        # The decoder model expects different input names
+        if 'enc' in self.decoder_input_names:
+            inputs['enc'] = encoder_out
+            inputs['enc_len'] = encoder_out_lens
+        elif 'encoder_out' in self.decoder_input_names:
+            inputs['encoder_out'] = encoder_out
+            inputs['encoder_out_lens'] = encoder_out_lens
+        
+        # Add acoustic_embeds if required (usually zeros for non-contextual models)
+        if 'acoustic_embeds' in self.decoder_input_names:
+            # Create dummy acoustic embeds (usually not used in standard paraformer)
+            acoustic_embeds = np.zeros((1, 1, 512), dtype=np.float32)
+            inputs['acoustic_embeds'] = acoustic_embeds
+            inputs['acoustic_embeds_len'] = np.array([1], dtype=np.int32)
+        
+        # Add decoder cache if required (usually for streaming decoder)
+        for i in range(16):
+            cache_name = f'in_cache_{i}'
+            if cache_name in self.decoder_input_names:
+                # Create zero cache if not exists
+                inputs[cache_name] = np.zeros((1, 512, 10), dtype=np.float32)
         
         # Run decoder
         outputs = self.decoder_session.run(self.decoder_output_names, inputs)
         
         # Extract predictions (argmax)
-        # Output shape: [1, T', vocab_size]
-        predictions = outputs[0][0]  # [T', vocab_size]
-        token_ids = np.argmax(predictions, axis=-1).tolist()
+        # Output shape: [1, T', vocab_size] or just predictions
+        predictions = outputs[0]
+        if len(predictions.shape) == 3:
+            predictions = predictions[0]  # [T', vocab_size]
+            token_ids = np.argmax(predictions, axis=-1).tolist()
+        elif len(predictions.shape) == 2:
+            # Already [T', vocab_size]
+            token_ids = np.argmax(predictions, axis=-1).tolist()
+        else:
+            # Already token IDs
+            token_ids = predictions.flatten().tolist()
         
         return token_ids
     
@@ -345,6 +388,11 @@ class OfflineASRModel:
         # Get model input/output names
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
+        
+        # Log model I/O for debugging
+        from loguru import logger
+        logger.debug(f"Offline ASR inputs: {self.input_names}")
+        logger.debug(f"Offline ASR outputs: {self.output_names}")
     
     def extract_features(self, audio: np.ndarray) -> np.ndarray:
         """Extract features for ASR
