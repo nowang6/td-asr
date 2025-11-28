@@ -41,6 +41,16 @@ class TwoPassASREngine:
         self.punc_model = PUNCModel(self.punc_model_dir, quantize, thread_num)
         
         # Frontends
+        # VAD frontend: lfr_m=5, lfr_n=1 -> 80*5=400 dims
+        self.vad_frontend = WavFrontendOnline(
+            fs=SAMPLE_RATE,
+            n_mels=80,
+            frame_length=25,
+            frame_shift=10,
+            lfr_m=5,
+            lfr_n=1,
+        )
+        # Online ASR frontend: lfr_m=7, lfr_n=6 -> 80*7=560 dims
         self.online_frontend = WavFrontendOnline(
             fs=SAMPLE_RATE,
             n_mels=80,
@@ -49,6 +59,7 @@ class TwoPassASREngine:
             lfr_m=7,
             lfr_n=6,
         )
+        # Offline ASR frontend: lfr_m=7, lfr_n=6 -> 80*7=560 dims
         self.offline_frontend = WavFrontend(
             fs=SAMPLE_RATE,
             n_mels=80,
@@ -67,6 +78,7 @@ class TwoPassASREngine:
         """Reset engine state"""
         self.vad_model.reset()
         self.online_asr_model.reset()
+        self.vad_frontend.reset()
         self.online_frontend.reset()
         self.audio_buffer = np.array([], dtype=np.float32)
     
@@ -88,14 +100,21 @@ class TwoPassASREngine:
             - is_final: Whether result is final
             - is_endpoint: Whether VAD endpoint detected
         """
-        # Extract features
-        features = self.online_frontend.extract_fbank_online(
+        # Extract VAD features (400 dims: 80*5)
+        vad_features = self.vad_frontend.extract_fbank_online(
             audio_chunk,
             cmvn=self.vad_model.cmvn,
             is_final=is_final,
         )
         
-        if len(features) == 0:
+        # Extract ASR features (560 dims: 80*7)
+        asr_features = self.online_frontend.extract_fbank_online(
+            audio_chunk,
+            cmvn=self.online_asr_model.cmvn if hasattr(self.online_asr_model, 'cmvn') and self.online_asr_model.cmvn is not None else None,
+            is_final=is_final,
+        )
+        
+        if len(vad_features) == 0:
             return {
                 "text": "",
                 "is_final": False,
@@ -103,7 +122,7 @@ class TwoPassASREngine:
             }
         
         # VAD
-        probs, is_speech, is_endpoint = self.vad_model.infer(features, is_final)
+        probs, is_speech, is_endpoint = self.vad_model.infer(vad_features, is_final)
         
         # Only process if speech detected
         if not np.any(is_speech) and not is_final:
@@ -113,8 +132,10 @@ class TwoPassASREngine:
                 "is_endpoint": is_endpoint,
             }
         
-        # Online ASR
-        text = self.online_asr_model.infer(features, is_final)
+        # Online ASR (only if we have ASR features)
+        text = ""
+        if len(asr_features) > 0:
+            text = self.online_asr_model.infer(asr_features, is_final)
         
         # Accumulate audio for offline processing
         self.audio_buffer = np.concatenate([self.audio_buffer, audio_chunk])

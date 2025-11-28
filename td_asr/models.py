@@ -208,6 +208,9 @@ class OnlineASRModel(ModelLoader):
         self.encoder_session = self._load_onnx_model("model")  # encoder
         self.decoder_session = self._load_onnx_model("decoder")
         
+        # Load CMVN
+        self.cmvn = self._load_cmvn()
+        
         # Load tokens
         self.tokens = self._load_tokens()
         
