@@ -85,6 +85,10 @@ async def websocket_endpoint(websocket: WebSocket):
     connection_state = {
         "sample_rate": 16000,
         "wav_format": "pcm",
+        "wav_name": "",
+        "mode": "2pass",
+        "audio_buffer": np.array([], dtype=np.float32),
+        "is_speaking": False,
     }
     
     try:
@@ -93,7 +97,7 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive()
             
             if "bytes" in data:
-                # Audio data
+                # Audio data (PCM 16-bit)
                 audio_bytes = data["bytes"]
                 audio = bytes_to_float32(audio_bytes)
                 
@@ -106,51 +110,109 @@ async def websocket_endpoint(websocket: WebSocket):
                         16000,
                     )
                 
-                # Process audio
-                results = asr_engine.process_2pass(audio, is_final=False)
+                # Accumulate audio in buffer
+                connection_state["audio_buffer"] = np.concatenate([
+                    connection_state["audio_buffer"],
+                    audio
+                ])
                 
-                # Send results
-                for result in results:
-                    response = {
-                        "text": result["text"],
-                        "is_final": result.get("is_final", False),
-                        "wav_name": "",
-                    }
-                    await websocket.send_json(response)
+                # Process audio in chunks (similar to C++ implementation)
+                # Process in 800 sample chunks (50ms at 16kHz)
+                chunk_size = 800
+                while len(connection_state["audio_buffer"]) >= chunk_size:
+                    chunk = connection_state["audio_buffer"][:chunk_size]
+                    connection_state["audio_buffer"] = connection_state["audio_buffer"][chunk_size:]
+                    
+                    # Process audio chunk
+                    results = asr_engine.process_2pass(chunk, is_final=False)
+                    
+                    # Send results
+                    for result in results:
+                        if result.get("text"):  # Only send non-empty results
+                            response = {
+                                "text": result["text"],
+                                "is_final": result.get("is_final", False),
+                                "wav_name": connection_state["wav_name"],
+                            }
+                            await websocket.send_json(response)
             
             elif "text" in data:
-                # Text message (control)
-                message = json.loads(data["text"])
+                # Text message (JSON configuration or control)
+                try:
+                    message = json.loads(data["text"])
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON message: {e}")
+                    continue
                 
-                if message.get("mode") == "close":
-                    # Final processing
-                    final_results = asr_engine.process_2pass(
-                        np.array([], dtype=np.float32),  # Empty, trigger final with buffer
-                        is_final=True,
-                    )
-                    for result in final_results:
-                        response = {
-                            "text": result["text"],
-                            "is_final": True,
-                            "wav_name": "",
-                        }
-                        await websocket.send_json(response)
+                # Handle configuration messages (from client initialization)
+                if "wav_name" in message:
+                    connection_state["wav_name"] = message["wav_name"]
+                
+                if "mode" in message:
+                    connection_state["mode"] = message["mode"]
+                
+                if "wav_format" in message:
+                    connection_state["wav_format"] = message["wav_format"]
+                
+                if "audio_fs" in message:
+                    connection_state["sample_rate"] = message["audio_fs"]
+                
+                if "is_speaking" in message:
+                    connection_state["is_speaking"] = message["is_speaking"]
+                
+                # Handle final message (is_speaking=false or is_finished=true)
+                is_finished = (
+                    message.get("is_speaking") == False or
+                    message.get("is_finished") == True
+                )
+                
+                if is_finished and connection_state["is_speaking"]:
+                    # Process remaining audio buffer
+                    if len(connection_state["audio_buffer"]) > 0:
+                        final_results = asr_engine.process_2pass(
+                            connection_state["audio_buffer"],
+                            is_final=True,
+                        )
+                        connection_state["audio_buffer"] = np.array([], dtype=np.float32)
+                        
+                        for result in final_results:
+                            if result.get("text"):
+                                response = {
+                                    "text": result["text"],
+                                    "is_final": True,
+                                    "wav_name": connection_state["wav_name"],
+                                }
+                                await websocket.send_json(response)
                     
-                    # Reset engine for this connection
+                    # Reset for next session
                     asr_engine.reset()
+                    connection_state["is_speaking"] = False
+                    connection_state["audio_buffer"] = np.array([], dtype=np.float32)
+                
+                # Handle legacy control messages
+                elif message.get("mode") == "close":
+                    # Final processing
+                    if len(connection_state["audio_buffer"]) > 0:
+                        final_results = asr_engine.process_2pass(
+                            connection_state["audio_buffer"],
+                            is_final=True,
+                        )
+                        for result in final_results:
+                            response = {
+                                "text": result["text"],
+                                "is_final": True,
+                                "wav_name": connection_state["wav_name"],
+                            }
+                            await websocket.send_json(response)
                     
+                    asr_engine.reset()
                     break
                 
                 elif message.get("mode") == "reset":
                     # Reset connection
                     asr_engine.reset()
+                    connection_state["audio_buffer"] = np.array([], dtype=np.float32)
                     await websocket.send_json({"status": "reset"})
-                
-                elif "sample_rate" in message:
-                    connection_state["sample_rate"] = message["sample_rate"]
-                
-                elif "wav_format" in message:
-                    connection_state["wav_format"] = message["wav_format"]
     
     except WebSocketDisconnect:
         logger.info("Client disconnected")

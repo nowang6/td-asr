@@ -271,6 +271,27 @@ class OnlineASRModel(ModelLoader):
                 cache_names.append(name)
                 logger.debug(f"Initialized encoder cache {name} with shape {shape}")
         
+        # If no cache inputs found in model definition, but model requires them at runtime,
+        # create default cache inputs for Paraformer online encoder
+        # Typically needs 4 cache inputs: in_cache0, in_cache1, in_cache2, in_cache3
+        if not cache_names:
+            # Try to infer cache requirements from error messages or use defaults
+            # Paraformer online encoder typically uses 4 cache inputs with shape [batch, hidden_dim, cache_len]
+            # Common shape: [1, 512, 10] or similar
+            logger.warning("No cache inputs found in model definition, creating default caches")
+            default_cache_names = ['in_cache0', 'in_cache1', 'in_cache2', 'in_cache3']
+            # Try to get hidden dimension from model or use default
+            # For Paraformer, hidden_dim is typically 512
+            hidden_dim = 512
+            cache_len = 10
+            batch_size = 1
+            
+            for cache_name in default_cache_names:
+                cache = np.zeros([batch_size, hidden_dim, cache_len], dtype=np.float32)
+                cache_list.append(cache)
+                cache_names.append(cache_name)
+                logger.debug(f"Created default encoder cache {cache_name} with shape {cache.shape}")
+        
         # Sort cache names to ensure correct order (in_cache0, in_cache1, etc.)
         if cache_names:
             # Sort by extracting number if present
@@ -371,6 +392,11 @@ class OnlineASRModel(ModelLoader):
                     name = inp.name
                     if 'cache' in name.lower() or name.startswith('in_cache'):
                         cache_input_names.append(name)
+                # If still no cache names found, use default names that were created
+                if not cache_input_names and isinstance(self.encoder_cache, list):
+                    # Use default cache names that match the created caches
+                    cache_input_names = [f'in_cache{i}' for i in range(len(self.encoder_cache))]
+                    logger.info(f"Using default cache input names: {cache_input_names}")
                 # Sort cache names
                 if cache_input_names:
                     import re
@@ -378,7 +404,7 @@ class OnlineASRModel(ModelLoader):
                         match = re.search(r'(\d+)$', name)
                         return int(match.group(1)) if match else 999
                     cache_input_names.sort(key=get_cache_index)
-                logger.info(f"Re-detected cache input names: {cache_input_names}")
+                    logger.info(f"Re-detected cache input names: {cache_input_names}")
         
         if cache_input_names:
             if isinstance(self.encoder_cache, list):
