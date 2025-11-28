@@ -70,18 +70,29 @@ def load_cmvn(cmvn_path: Path) -> np.ndarray:
             continue
         elif line.startswith('<LearnRateCoef>'):
             # Extract values from this line
-            parts = line.split()
-            if current_section == 'mean' and len(parts) > 3:
-                # Extract mean values (from index 3 to second-to-last)
-                values = [float(x) for x in parts[3:-1] if x.replace('.', '').replace('-', '').replace('e', '').isdigit()]
-                mean_stats.extend(values)
-            elif current_section == 'var' and len(parts) > 3:
-                # Extract variance values (from index 3 to second-to-last)
-                values = [float(x) for x in parts[3:-1] if x.replace('.', '').replace('-', '').replace('e', '').isdigit()]
-                var_stats.extend(values)
+            # Format: <LearnRateCoef> 0 [ value1 value2 ... ]
+            parts = line.split('[')
+            if len(parts) > 1:
+                # Get content between [ and ]
+                values_str = parts[1].split(']')[0]
+                values = [float(x) for x in values_str.split() if x]
+                
+                if current_section == 'mean':
+                    mean_stats = values
+                elif current_section == 'var':
+                    var_stats = values
     
-    # Return as [mean, var] format
+    # Ensure we have the same number of mean and var values
+    if len(mean_stats) != len(var_stats):
+        raise ValueError(f"CMVN dimension mismatch: mean={len(mean_stats)}, var={len(var_stats)}")
+    
+    # Return as [mean, var] format with shape [2, feature_dim]
     cmvn = np.array([mean_stats, var_stats], dtype=np.float32)
+    
+    # Debug output
+    from loguru import logger
+    logger.debug(f"Loaded CMVN from {cmvn_path.name}: shape={cmvn.shape}")
+    
     return cmvn
 
 
@@ -95,11 +106,20 @@ def apply_cmvn(features: np.ndarray, cmvn: np.ndarray) -> np.ndarray:
     Returns:
         Normalized features
     """
-    mean = cmvn[0]
-    var = cmvn[1]
+    if len(features) == 0:
+        return features
     
-    # Normalize: (x - mean) / sqrt(var)
-    # In Kaldi format, var is actually 1/scale, so we multiply
+    mean = cmvn[0]  # shape: (feature_dim,)
+    var = cmvn[1]   # shape: (feature_dim,)
+    
+    # Check dimension match
+    if features.shape[1] != len(mean):
+        from loguru import logger
+        logger.error(f"Feature dimension mismatch: features={features.shape}, mean={mean.shape}, var={var.shape}")
+        raise ValueError(f"Feature dim {features.shape[1]} != CMVN dim {len(mean)}")
+    
+    # Normalize: (x - mean) * scale
+    # In Kaldi format, var is actually 1/std (the scale factor), so we multiply
     return (features - mean) * var
 
 
